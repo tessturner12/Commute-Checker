@@ -7,6 +7,7 @@ and emails a summary with disruption alerts.
 
 import os
 import sys
+import time
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -25,10 +26,11 @@ ARRIVAL_TIME = "0845"
 MAX_JOURNEYS = 3
 WALK_THRESHOLD_MINS = 15
 
-TFL_APP_KEY = os.getenv("TFL_APP_KEY", "")
-GMAIL_USER = os.getenv("GMAIL_USER", "tess.turner@quantum.media")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-RECIPIENT = os.getenv("RECIPIENT_EMAIL", GMAIL_USER)
+TFL_APP_KEY = os.getenv("TFL_APP_KEY", "").lstrip('﻿').strip()
+GMAIL_USER = os.getenv("GMAIL_USER", "tess.turner@quantum.media").lstrip('﻿').strip()
+_pwd = os.getenv("GMAIL_APP_PASSWORD", "").lstrip('﻿').strip()
+GMAIL_APP_PASSWORD = _pwd if _pwd else None
+RECIPIENT = os.getenv("RECIPIENT_EMAIL", GMAIL_USER).lstrip('﻿').strip()
 
 MODE_ICONS = {
     "bus": "🚌",
@@ -44,6 +46,21 @@ MODE_ICONS = {
 _walk_cache = {}
 
 
+def tfl_get(url, params, timeout=15, retries=3):
+    """GET wrapper with exponential backoff on 429."""
+    for attempt in range(retries):
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code == 429:
+            wait = 5 * (2 ** attempt)  # 5s, 10s, 20s
+            print(f"TfL rate limited, retrying in {wait}s (attempt {attempt + 1}/{retries})...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r
+    r.raise_for_status()
+    return r
+
+
 def get_walking_time(lat, lon, label):
     """Return walking minutes from lat/lon to the destination. Cached by label."""
     if label in _walk_cache:
@@ -56,8 +73,7 @@ def get_walking_time(lat, lon, label):
         params["app_key"] = TFL_APP_KEY
 
     try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+        r = tfl_get(url, params, timeout=10)
         journeys = r.json().get("journeys", [])
         result = journeys[0].get("duration") if journeys else None
     except Exception:
@@ -116,8 +132,7 @@ def get_journeys():
     if TFL_APP_KEY:
         params["app_key"] = TFL_APP_KEY
 
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
+    r = tfl_get(url, params, timeout=15)
     return r.json().get("journeys", [])
 
 
@@ -134,8 +149,7 @@ def get_overground_journey():
     if TFL_APP_KEY:
         params["app_key"] = TFL_APP_KEY
     try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
+        r = tfl_get(url, params, timeout=15)
         for j in r.json().get("journeys", []):
             legs = j.get("legs", [])
             if any(leg.get("mode", {}).get("id") == "overground" for leg in legs):
