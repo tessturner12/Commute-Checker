@@ -2,7 +2,7 @@ name: TfL Commute Check
 
 on:
   schedule:
-    - cron: '45 5 * * 1-5'  # 6:45am BST (UTC+1) Mon-Fri — update to '45 6' in winter (GMT)
+    - cron: '45 3 * * 1-5'  # targets ~6:45am BST — set early to account for GitHub Actions queue delay (~3h on free tier)
   workflow_dispatch:          # allow manual trigger from GitHub Actions tab
 
 jobs:
