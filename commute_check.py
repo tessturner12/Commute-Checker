@@ -11,6 +11,7 @@ import time
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -25,6 +26,13 @@ TO_POSTCODE = "N52EF"
 ARRIVAL_TIME = "0845"
 MAX_JOURNEYS = 3
 WALK_THRESHOLD_MINS = 15
+
+LONDON_TZ = ZoneInfo("Europe/London")
+ACTON_CENTRAL_STOP_ID = "910GACTNCTL"
+OG_LINE_NAME = "Mildmay"
+OG_TOWARDS_KEYWORD = "stratford"  # direction towards Highbury & Islington
+OG_WINDOW_START = "07:30"
+OG_WINDOW_END = "08:10"
 
 TFL_APP_KEY = os.getenv("TFL_APP_KEY", "").lstrip('﻿').strip()
 GMAIL_USER = os.getenv("GMAIL_USER", "tess.turner@quantum.media").lstrip('﻿').strip()
@@ -89,12 +97,17 @@ def process_legs(legs):
     - Records first bus and overground departure times.
     - If a bus leg is within WALK_THRESHOLD_MINS of the destination, replaces it
       (and all subsequent legs) with a single synthetic walk leg.
+    - If a leg arrives at Highbury & Islington and the next leg is National Rail,
+      drops it (and all subsequent legs), replacing with a walk instead.
     Returns (display_legs, key_times) where key_times is {"bus": "HH:MM", "overground": "HH:MM"}.
     """
     key_times = {}
     display_legs = []
+    n = len(legs)
+    i = 0
 
-    for leg in legs:
+    while i < n:
+        leg = legs[i]
         mode_id = leg.get("mode", {}).get("id", "")
         dep_time = parse_time(leg.get("departureTime", ""))
 
@@ -117,6 +130,22 @@ def process_legs(legs):
                     break
 
         display_legs.append(leg)
+
+        arr_point = leg.get("arrivalPoint", {})
+        next_leg = legs[i + 1] if i + 1 < n else None
+        if (
+            "highbury & islington" in arr_point.get("commonName", "").lower()
+            and next_leg is not None
+            and next_leg.get("mode", {}).get("id") == "national-rail"
+        ):
+            lat, lon = arr_point.get("lat"), arr_point.get("lon")
+            if lat is not None and lon is not None:
+                walk_mins = get_walking_time(lat, lon, arr_point.get("commonName", ""))
+                if walk_mins is not None:
+                    display_legs.append({"_synthetic": True, "walk_mins": walk_mins})
+            break
+
+        i += 1
 
     return display_legs, key_times
 
@@ -162,6 +191,43 @@ def get_overground_journey():
     except Exception:
         pass
     return None
+
+
+def get_overground_departures():
+    """
+    Fetch upcoming Mildmay line (Overground) departures from Acton Central
+    towards Highbury & Islington/Stratford, between OG_WINDOW_START and OG_WINDOW_END.
+    Returns a sorted list of "HH:MM" strings.
+    """
+    url = f"https://api.tfl.gov.uk/StopPoint/{ACTON_CENTRAL_STOP_ID}/Arrivals"
+    params = {}
+    if TFL_APP_KEY:
+        params["app_key"] = TFL_APP_KEY
+
+    try:
+        r = tfl_get(url, params, timeout=10)
+        arrivals = r.json()
+    except Exception:
+        return []
+
+    times = set()
+    for a in arrivals:
+        if a.get("lineName") != OG_LINE_NAME:
+            continue
+        if OG_TOWARDS_KEYWORD not in a.get("destinationName", "").lower():
+            continue
+        expected = a.get("expectedArrival", "")
+        if not expected:
+            continue
+        try:
+            dt_utc = datetime.fromisoformat(expected.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        hhmm = dt_utc.astimezone(LONDON_TZ).strftime("%H:%M")
+        if OG_WINDOW_START <= hhmm <= OG_WINDOW_END:
+            times.add(hhmm)
+
+    return sorted(times)
 
 
 def parse_time(dt_str):
@@ -226,7 +292,7 @@ def render_journey(lines, journey, label):
     lines.append("")
 
 
-def build_email_body(journeys, overground_journey=None):
+def build_email_body(journeys, overground_journey=None, overground_departures=None):
     today = datetime.now().strftime("%A %d %B %Y")
     lines = [
         f"TfL Commute Check — {today}",
@@ -234,6 +300,11 @@ def build_email_body(journeys, overground_journey=None):
         "=" * 52,
         "",
     ]
+
+    if overground_departures:
+        times_str = ", ".join(overground_departures)
+        lines.append(f"🚆 Mildmay departures — Acton Central ({OG_WINDOW_START}–{OG_WINDOW_END}): {times_str}")
+        lines.append("")
 
     for i, journey in enumerate(journeys, 1):
         render_journey(lines, journey, f"Option {i}")
@@ -274,7 +345,9 @@ def main():
         print("No journey options returned from TfL.")
         return
 
-    body = build_email_body(journeys, overground_journey)
+    overground_departures = get_overground_departures()
+
+    body = build_email_body(journeys, overground_journey, overground_departures)
     any_disruption = any(
         leg.get("disruptions")
         for j in journeys
